@@ -83,6 +83,9 @@ Tests use a deterministic fake model and never spend API credits:
 .\venv\Scripts\python.exe -m pytest -q
 ```
 
+## Important 
+This repo is built on top of langchain and tested on the mistral API, changing either should take about 10 minutes with small modifications.
+
 ## Suggested exercises
 
 1. Introduce a cycle in a test plan and observe validation fail before execution.
