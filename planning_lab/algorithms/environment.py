@@ -19,9 +19,8 @@ without changing their own code.
 from datetime import date
 from dataclasses import dataclass
 
+
 from ..models import EnvironmentFeedback
-# TODO: import whatever client you use to call the MCP server tool,
-# e.g. from your agent/ package's MCP client wrapper.
 
 
 @dataclass
@@ -35,12 +34,23 @@ class ProposedPath:
 class LearningPathEnvironment:
     """Grounded evaluator: checks a proposed learning path against real
     BrightPeak data (courses, prerequisites, learning_goals) via the
-    get_path_planning_data MCP tool. No LLM call, no randomness."""
+    get_path_planning_data MCP tool. No LLM call, no randomness.
 
-    def __init__(self, mcp_client):
-        # TODO: store whatever object lets you call
-        # get_path_planning_data(student_id) and get back its `data` dict.
-        self.mcp_client = mcp_client
+    Follows the same pattern agent/loop.py already uses for db_tool
+    questions (`from server import get_student_profile`) -- the MCP tool
+    functions are plain Python functions decorated with @mcp.tool(), so
+    they can be imported and called directly, no separate MCP client
+    object needed here.
+    """
+
+    def __init__(self, mcp_server_path: str | None = None):
+        # mcp_server_path: optional sys.path entry pointing at your
+        # mcp_server/ folder, in case this file is imported from somewhere
+        # that doesn't already have it on sys.path (agent/loop.py adds it
+        # via sys.path.insert -- mirror that here if needed).
+        if mcp_server_path:
+            import sys
+            sys.path.insert(0, mcp_server_path)
 
     def evaluate(self, state: ProposedPath) -> EnvironmentFeedback:
         data = self._fetch_data(state.student_id)
@@ -54,49 +64,115 @@ class LearningPathEnvironment:
             state, data["prerequisites"], data["completed_course_ids"]
         ))
 
-        # ------------------------------------------------------------
-        # TODO 2 — Budget
-        # Sum courses_by_id[cid]["price"] for cid in state.course_ids.
-        # Compare against data["learning_goal"]["budget"].
-        # ------------------------------------------------------------
+        goal = data["learning_goal"]
+        if goal is None:
+            return EnvironmentFeedback(
+                success=False, score=0.0,
+                details=["No learning_goal set for this student; cannot evaluate a path."],
+            )
+
+        path_courses = [courses_by_id[cid] for cid in state.course_ids if cid in courses_by_id]
+        checks_passed = 1 if not issues else 0  # prerequisites check result so far
+        total_checks = 6
 
         # ------------------------------------------------------------
-        # TODO 3 — Weekly hours (needs date overlap logic)
-        # For any two courses in the path whose [start_date, end_date]
-        # ranges overlap, sum their weekly_hours and compare against
-        # data["learning_goal"]["weekly_hours_available"].
-        # Hint: parse start_date/end_date with datetime.date.fromisoformat,
-        # two ranges [a_start,a_end] and [b_start,b_end] overlap when
-        # a_start <= b_end and b_start <= a_end.
+        # TODO 2 — Budget (done)
         # ------------------------------------------------------------
+        total_price = sum(c["price"] for c in path_courses)
+        if total_price > goal["budget"]:
+            issues.append(
+                f"Path costs {total_price:.2f}, which exceeds the budget of {goal['budget']:.2f}."
+            )
+        else:
+            checks_passed += 1
 
         # ------------------------------------------------------------
-        # TODO 4 — Schedule ordering for dependent courses
-        # If course B depends on course A (via prerequisites) and both are
-        # in the path (not already completed), A's end_date must be <=
-        # B's start_date.
+        # TODO 3 — Weekly hours / date overlap (done)
         # ------------------------------------------------------------
+        hours_ok = True
+        for i, a in enumerate(path_courses):
+            a_start = date.fromisoformat(a["start_date"])
+            a_end = date.fromisoformat(a["end_date"])
+            overlapping_hours = a["weekly_hours"]
+            for j, b in enumerate(path_courses):
+                if i == j:
+                    continue
+                b_start = date.fromisoformat(b["start_date"])
+                b_end = date.fromisoformat(b["end_date"])
+                if a_start <= b_end and b_start <= a_end:
+                    overlapping_hours += b["weekly_hours"]
+            if overlapping_hours > goal["weekly_hours_available"]:
+                hours_ok = False
+                issues.append(
+                    f"Course {a['course_id']} ('{a['title']}') overlaps with other courses "
+                    f"totalling {overlapping_hours} weekly hours, exceeding the "
+                    f"{goal['weekly_hours_available']} hours/week available."
+                )
+        if hours_ok:
+            checks_passed += 1
 
         # ------------------------------------------------------------
-        # TODO 5 — Skill coverage
-        # Union all skill_tags (comma-separated string -> set) across the
-        # courses in the path. Every tag in data["required_skills"] must
-        # appear in that union.
+        # TODO 4 — Schedule ordering for dependent courses (done)
         # ------------------------------------------------------------
+        required_by_course: dict[int, list[int]] = {}
+        for edge in data["prerequisites"]:
+            required_by_course.setdefault(edge["course_id"], []).append(edge["prerequisite_course_id"])
+
+        schedule_ok = True
+        completed_ids = set(data["completed_course_ids"])
+        for course in path_courses:
+            for prereq_id in required_by_course.get(course["course_id"], []):
+                if prereq_id in completed_ids or prereq_id not in courses_by_id:
+                    continue
+                prereq = courses_by_id[prereq_id]
+                if prereq_id in [c["course_id"] for c in path_courses]:
+                    prereq_end = date.fromisoformat(prereq["end_date"])
+                    course_start = date.fromisoformat(course["start_date"])
+                    if prereq_end > course_start:
+                        schedule_ok = False
+                        issues.append(
+                            f"Course {course['course_id']} starts {course['start_date']}, before "
+                            f"its prerequisite {prereq_id} ends ({prereq['end_date']})."
+                        )
+        if schedule_ok:
+            checks_passed += 1
 
         # ------------------------------------------------------------
-        # TODO 6 — Deadline
-        # The max end_date among courses in the path must be <=
-        # data["learning_goal"]["target_date"].
+        # TODO 5 — Skill coverage (done)
         # ------------------------------------------------------------
+        covered_skills: set[str] = set()
+        for c in path_courses:
+            covered_skills.update(tag.strip() for tag in c["skill_tags"].split(","))
+        required_skills = set(data["required_skills"])
+        missing_skills = required_skills - covered_skills
+        if missing_skills:
+            issues.append(
+                f"Path does not cover required skills: {', '.join(sorted(missing_skills))}."
+            )
+        else:
+            checks_passed += 1
 
         # ------------------------------------------------------------
-        # TODO 7 — Combine results
-        # success = (len(issues) == 0)
-        # score = fraction of the 6 checks above that passed (e.g. 5/6 = 0.83)
-        # Return EnvironmentFeedback(success=success, score=score, details=issues)
+        # TODO 6 — Deadline (done)
         # ------------------------------------------------------------
-        raise NotImplementedError("Fill in TODOs 1-7 above")
+        if path_courses:
+            latest_end = max(date.fromisoformat(c["end_date"]) for c in path_courses)
+            target_date = date.fromisoformat(goal["target_date"])
+            if latest_end > target_date:
+                issues.append(
+                    f"Path finishes {latest_end.isoformat()}, after the target date {goal['target_date']}."
+                )
+            else:
+                checks_passed += 1
+        # (an empty path trivially meets the deadline but every other
+        # check above would already have flagged it as useless)
+
+        # ------------------------------------------------------------
+        # TODO 7 — Combine results (done)
+        # ------------------------------------------------------------
+        success = len(issues) == 0
+        score = round(checks_passed / total_checks, 4)
+        return EnvironmentFeedback(success=success, score=score, details=issues)
 
     def _check_prerequisites(
         self,
@@ -144,7 +220,16 @@ class LearningPathEnvironment:
         return issues
 
     def _fetch_data(self, student_id: int) -> dict:
-        # TODO: call your MCP tool get_path_planning_data(student_id) here
-        # and return its ["data"] dict.
-        raise NotImplementedError("Wire this to your MCP client")
+        # Same pattern as agent/loop.py's _handle_db_tool_question:
+        # `from server import get_student_profile`. Requires mcp_server/
+        # to be on sys.path (pass mcp_server_path to __init__ if it isn't
+        # already, e.g. when this file is run standalone rather than
+        # through agent/loop.py which adds it itself).
+        from server import get_path_planning_data
+
+        result = get_path_planning_data(student_id)
+        if result["status"] != "success":
+            raise RuntimeError(f"get_path_planning_data failed: {result['message']}")
+        return result["data"]
+
 
